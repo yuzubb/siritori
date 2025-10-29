@@ -1,12 +1,11 @@
 import os
 import requests
 import random
+import sys
 from flask import Flask, request, jsonify
 # 形態素解析ライブラリ
 from janome.tokenizer import Tokenizer
-from janome.dic import Dictionary # 辞書データに直接アクセスするため
-
-app = Flask(__name__)
+from janome.dic import Dictionary 
 
 # --- グローバル変数 ---
 CHATWORK_API_TOKEN = os.environ.get("CHATWORK_API_TOKEN")
@@ -30,6 +29,8 @@ def initialize_bot():
     
     if not CHATWORK_API_TOKEN:
         print("エラー: CHATWORK_API_TOKEN が設定されていません。")
+        # 実行を停止し、Renderにエラーを伝える
+        sys.exit("API Token not set. Stopping deployment.") 
         return
 
     # 1-A. Bot自身のIDを取得
@@ -41,6 +42,7 @@ def initialize_bot():
         print(f"✅ BotのChatwork IDを取得しました: {BOT_ACCOUNT_ID}")
     except Exception as e:
         print(f"❌ Bot IDの取得に失敗しました: {e}")
+        sys.exit(f"Failed to get Bot ID: {e}")
 
     # 1-B. 【単語リストの自動取得】
     print("⏳ Janome辞書からしりとり用単語リストを構築中...")
@@ -50,7 +52,6 @@ def initialize_bot():
     KANA_MAP = {chr(i): chr(i - 96) for i in range(ord('ァ'), ord('ン') + 1)}
 
     for details in dict_data:
-        surface = details[0]
         # 辞書構造に依存するが、ここでは簡易的に読みを取得
         if len(details[1]) > 7:
             reading = details[1][7]
@@ -64,7 +65,7 @@ def initialize_bot():
                 # カタカナをひらがなに変換
                 hiragana_yomi = "".join([KANA_MAP.get(c, c) for c in reading]).lower()
                 
-                # 「ん」で終わる単語は除外
+                # 「ん」で終わる単語は除外、2文字以上の単語に限定
                 if not hiragana_yomi or hiragana_yomi[-1] == 'ん' or len(hiragana_yomi) < 2:
                     continue
                 
@@ -77,6 +78,14 @@ def initialize_bot():
                 SHIRITORI_WORDS[first_char].add(hiragana_yomi)
 
     print(f"✅ 単語リスト構築完了。先頭文字の種類: {len(SHIRITORI_WORDS)}種類")
+    if not SHIRITORI_WORDS:
+        sys.exit("単語リストが空です。辞書の読み込みに問題がある可能性があります。")
+
+
+# --- Flaskインスタンス化と初期化の実行 ---
+app = Flask(__name__)
+initialize_bot() 
+# -----------------------------------
 
 
 # --- 2. ユーティリティ関数 ---
@@ -84,7 +93,6 @@ def initialize_bot():
 def get_yomi(text):
     """形態素解析を行い、単語の正確な読み（ひらがな）を取得する"""
     yomi = ""
-    # 複数単語が投稿された場合、Botは最初に見つけた単語の読みを採用する
     for token in T.tokenize(text):
         if token.part_of_speech.startswith(('名詞', '動詞', '形容詞')):
             reading = token.reading
@@ -123,7 +131,6 @@ def get_bot_word(next_char, used_words_set):
     if not available_words:
         return None, None 
     
-    # ランダムに一つ選ぶ
     bot_yomi = random.choice(list(available_words))
     bot_surface = get_surface_form(bot_yomi)
     
@@ -137,7 +144,7 @@ def send_chatwork_message(room_id, message_body):
     try:
         response = requests.post(f"{API_URL}/rooms/{room_id}/messages", headers=headers, data=data)
         response.raise_for_status()
-        print(f"✅ メッセージ送信成功 (Room: {room_id})")
+        # print(f"✅ メッセージ送信成功 (Room: {room_id})")
     except Exception as e:
         print(f"❌ メッセージ送信失敗: {e}")
 
@@ -147,7 +154,6 @@ def send_chatwork_message(room_id, message_body):
 def chatwork_webhook():
     """ChatworkからのWebhookを受け取り、しりとりロジックを実行する"""
     
-    # データのチェックと抽出
     if not request.is_json: return jsonify({"message": "Invalid format"}), 400
     event_data = request.json.get("webhook_event")
     if not event_data or event_data.get("body") is None: return jsonify({"message": "No event data"}), 200
@@ -160,7 +166,7 @@ def chatwork_webhook():
     if account_id == BOT_ACCOUNT_ID:
         return jsonify({"message": "Self-message skipped"}), 200
 
-    # 状態の初期化
+    # 状態の初期化/取得
     if room_id not in GAME_STATUS:
         GAME_STATUS[room_id] = {"last_yomi": None, "used_words": set()}
         
@@ -168,7 +174,7 @@ def chatwork_webhook():
     
     # --- コマンド判定 ---
     if 'しりとりスタート' in raw_body:
-        status["last_yomi"] = "んご" # 初期単語の末尾が「ご」になるように設定（例）
+        status["last_yomi"] = None 
         status["used_words"] = set()
         message = f"🎉 しりとりスタート！ [To:{account_id}] さん、好きな単語から始めてね！"
         send_chatwork_message(room_id, message)
@@ -181,8 +187,6 @@ def chatwork_webhook():
         return jsonify({"message": "Waiting for start"}), 200
 
     # --- ユーザーのターン処理 ---
-    
-    # 1. 読みの取得と整形
     user_yomi = get_yomi(raw_body.strip())
     last_char = get_last_char(status["last_yomi"])
     
@@ -202,7 +206,7 @@ def chatwork_webhook():
         status["last_yomi"] = None
         return jsonify({"message": "Game Over (N)"}), 200
     
-    if user_yomi[0] != last_char:
+    if status["last_yomi"] is not None and user_yomi[0] != last_char:
         # 3. エラー応答 (文字違い)
         message = f"[To:{account_id}] さん、ルール違反です！前の単語は「{status['last_yomi']}」で「{last_char}」から始まります。「{last_char}」から始まる単語を言ってね。"
         send_chatwork_message(room_id, message)
@@ -242,9 +246,9 @@ def chatwork_webhook():
     
     return jsonify({"message": "Bot responded", "yomi": user_yomi}), 200
 
-# --- サーバー起動 ---
+# --- サーバー起動 (Gunicorn環境では実行されない) ---
 if __name__ == "__main__":
-    # Bot IDと単語リストを初期化
-    initialize_bot()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # Gunicorn実行時ではない場合のみ、app.runで実行
+    print("Running in development mode.")
+    app.run(host="0.0.0.0", port=port, debug=True)
